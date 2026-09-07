@@ -22,62 +22,85 @@ class KeyRequest(BaseModel):
 @app.post("/calculate")
 def calculate_score(data: KeyRequest):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8'
     }
     try:
-        res = requests.get(data.url, headers=headers, timeout=25)
+        req_url = data.url.strip()
+        # डबल स्लैश को ठीक करना
+        if "://" in req_url:
+            prot, rest = req_url.split("://", 1)
+            rest = re.sub(r'/+', '/', rest)
+            req_url = f"{prot}://{rest}"
+
+        res = requests.get(req_url, headers=headers, timeout=30)
+        res.encoding = 'utf-8'
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # 1. Candidate Info
+        # 1. कैंडिडेट विवरण
         candidate_info = {}
         for row in soup.find_all('tr'):
             tds = row.find_all('td')
             if len(tds) == 2:
                 k = tds[0].get_text(strip=True)
                 v = tds[1].get_text(strip=True)
-                if any(x in k for x in ["Roll", "Name", "Subject", "Date", "Center", "Community", "Registration"]):
+                if any(x in k for x in ["Roll", "Name", "Subject", "Date", "Center", "Community", "Registration", "अनुक्रमांक", "नाम"]):
                     candidate_info[k] = v
 
-        # 2. All questions panels
-        questions = soup.find_all('div', class_=re.compile(r'(question-pnl|grp-cntnr|section-cntnr)'))
-        if not questions:
-            # वैकल्पिक तरीका अगर div क्लास न मिले
-            questions = [tbl.find_parent('div') for tbl in soup.find_all('table', class_=re.compile(r'menu-tbl'))]
-            questions = [q for q in questions if q is not None]
+        # 2. प्रश्न खोजना
+        menu_tables = soup.find_all('table', class_=re.compile(r'menu-tbl|questionRowTbl', re.I))
+        
+        # अगर क्लास से न मिले तो 'Chosen Option' वाले टेबल खोजना
+        if not menu_tables:
+            for tbl in soup.find_all('table'):
+                if "Chosen Option" in tbl.get_text() or "चुना गया विकल्प" in tbl.get_text():
+                    menu_tables.append(tbl)
 
-        total_q = len(questions)
+        total_q = len(menu_tables)
         attempted = 0
         correct = 0
         wrong = 0
 
-        for q in questions:
+        for menu in menu_tables:
+            # पैरेंट कंटेनर
+            q_box = menu.find_parent('div', class_=re.compile(r'question-pnl|grp-cntnr|section-cntnr')) or menu.find_parent('table') or menu.parent
+
+            # 1. कैंडिडेट का चुना गया विकल्प
             chosen = ""
-            # Chosen option खोजना
-            for td in q.find_all(['td', 'span', 'b']):
-                text = td.get_text(strip=True)
-                if "Chosen Option" in text or "चुना गया विकल्प" in text:
-                    parts = text.split(":")
+            for tr in menu.find_all('tr'):
+                txt = tr.get_text()
+                if "Chosen Option" in txt or "चुना गया विकल्प" in txt:
+                    parts = txt.split(":")
                     if len(parts) > 1:
                         chosen = parts[1].strip()
-                    else:
-                        next_sib = td.find_next_sibling()
-                        if next_sib:
-                            chosen = next_sib.get_text(strip=True)
 
-            # Right Option खोजना
+            # 2. सही उत्तर (TCS iON tick image या rightAns)
             right_opt = ""
-            right_ans_elem = q.find(class_=re.compile(r'rightAns'))
-            if right_ans_elem:
-                parent_row = right_ans_elem.find_parent('tr')
-                if parent_row:
-                    cells = parent_row.find_all('td')
-                    if cells:
-                        raw_num = cells[0].get_text(strip=True)
-                        m = re.search(r'\d+', raw_num)
+            # तरीका A: rightAns क्लास
+            right_td = q_box.find(class_=re.compile(r'rightAns', re.I))
+            if right_td:
+                p_row = right_td.find_parent('tr')
+                if p_row:
+                    first_col = p_row.find('td')
+                    if first_col:
+                        m = re.search(r'\d+', first_col.get_text())
                         if m:
                             right_opt = m.group()
 
-            # Attempted check
+            # तरीका B: img src जिसमें tick या right हो
+            if not right_opt:
+                tick_img = q_box.find('img', src=re.compile(r'tick|correct|right', re.I))
+                if tick_img:
+                    p_row = tick_img.find_parent('tr')
+                    if p_row:
+                        first_col = p_row.find('td')
+                        if first_col:
+                            m = re.search(r'\d+', first_col.get_text())
+                            if m:
+                                right_opt = m.group()
+
+            # 3. स्कोर गणना
             if chosen and chosen not in ["--", "Not Attempted"] and chosen.isdigit():
                 attempted += 1
                 if chosen == right_opt:
